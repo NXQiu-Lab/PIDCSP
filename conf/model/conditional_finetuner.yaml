@@ -1,0 +1,41 @@
+_target_: pidcsp.pl_modules.conditional_finetuner.ConditionalCSPFinetuner
+
+
+pretrained_ckpt_path: ???
+freeze_backbone: true
+
+
+cond_hidden_dim: 128
+
+
+n_warmup_epochs: 5
+
+
+cost_prop_pred: 0.5
+
+
+cost_prop_clean: 3.0
+
+
+cost_contrast: 0.2
+
+
+cost_diffusion: 0.5
+
+
+cost_lattice_reg: 0.1
+
+
+lr: 1.0e-4
+weight_decay: 1.0e-6
+
+
+guidance_scale: 1.2
+p_uncond: 0.15
+
+
+timesteps: 1000
+time_dim: 256
+
+
+clean_t_max: 10

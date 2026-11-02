@@ -1,0 +1,47 @@
+_target_: pidcsp.pl_modules.classifier.pidcsp_g_classifier_trainer.ClassifierTrainer
+
+
+pretrained_ckpt_path: ???
+
+
+hidden_dim: 512
+time_dim: 256
+num_freqs: 128
+edge_style: fc
+
+
+clf_hidden_dim: 256
+n_mp_layers: 4
+
+
+phys_data_path: ${oc.env:PROJECT_ROOT,.}/embeddings/phys_embedding_data.pt
+use_phys_emb: true
+phys_props: true
+phys_pg: true
+
+
+num_heads: 4
+dropout: 0.0
+alpha: 0.2
+phys_edge_weight: 0.5
+
+
+use_time_phys_mod: true
+time_mod_min: 0.7
+
+
+lr: 2.0e-4
+weight_decay: 1.0e-5
+
+
+t_warmup_steps: 2000
+low_t_ratio: 0.4
+
+
+prop_keys:
+  - formation_energy_per_atom
+  - band_gap
+
+prop_loss_weights:
+  formation_energy_per_atom: 1.0
+  band_gap: 2.0

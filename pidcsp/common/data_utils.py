@@ -1,0 +1,1741 @@
+import numpy as np
+import pandas as pd
+import networkx as nx
+import torch
+import copy
+import itertools
+
+from pymatgen.core.structure import Structure
+from pymatgen.core.lattice import Lattice
+from pymatgen.analysis.graphs import StructureGraph
+from pymatgen.analysis import local_env
+
+from networkx.algorithms.components import is_connected
+
+from sklearn.metrics import accuracy_score, recall_score, precision_score
+
+from torch_scatter import scatter
+from torch_scatter import segment_coo, segment_csr
+
+from p_tqdm import p_umap
+
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+
+from pathos.pools import ProcessPool as Pool
+
+from tqdm import tqdm
+from functools import partial
+
+import faulthandler
+faulthandler.enable()
+
+
+OFFSET_LIST = [
+    [-1, -1, -1],
+    [-1, -1, 0],
+    [-1, -1, 1],
+    [-1, 0, -1],
+    [-1, 0, 0],
+    [-1, 0, 1],
+    [-1, 1, -1],
+    [-1, 1, 0],
+    [-1, 1, 1],
+    [0, -1, -1],
+    [0, -1, 0],
+    [0, -1, 1],
+    [0, 0, -1],
+    [0, 0, 0],
+    [0, 0, 1],
+    [0, 1, -1],
+    [0, 1, 0],
+    [0, 1, 1],
+    [1, -1, -1],
+    [1, -1, 0],
+    [1, -1, 1],
+    [1, 0, -1],
+    [1, 0, 0],
+    [1, 0, 1],
+    [1, 1, -1],
+    [1, 1, 0],
+    [1, 1, 1],
+]
+
+EPSILON = 1e-5
+
+chemical_symbols = [
+
+    'X',
+
+    'H', 'He',
+
+    'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
+
+    'Na', 'Mg', 'Al', 'Si', 'P', 'S', 'Cl', 'Ar',
+
+    'K', 'Ca', 'Sc', 'Ti', 'V', 'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+    'Ga', 'Ge', 'As', 'Se', 'Br', 'Kr',
+
+    'Rb', 'Sr', 'Y', 'Zr', 'Nb', 'Mo', 'Tc', 'Ru', 'Rh', 'Pd', 'Ag', 'Cd',
+    'In', 'Sn', 'Sb', 'Te', 'I', 'Xe',
+
+    'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd', 'Pm', 'Sm', 'Eu', 'Gd', 'Tb', 'Dy',
+    'Ho', 'Er', 'Tm', 'Yb', 'Lu',
+    'Hf', 'Ta', 'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg', 'Tl', 'Pb', 'Bi',
+    'Po', 'At', 'Rn',
+
+    'Fr', 'Ra', 'Ac', 'Th', 'Pa', 'U', 'Np', 'Pu', 'Am', 'Cm', 'Bk',
+    'Cf', 'Es', 'Fm', 'Md', 'No', 'Lr',
+    'Rf', 'Db', 'Sg', 'Bh', 'Hs', 'Mt', 'Ds', 'Rg', 'Cn', 'Nh', 'Fl', 'Mc',
+    'Lv', 'Ts', 'Og']
+
+
+CrystalNN = local_env.CrystalNN(
+    distance_cutoffs=None, x_diff_weight=-1, porous_adjustment=False)
+
+
+def build_crystal(crystal_str, niggli=True, primitive=False):
+
+    crystal = Structure.from_str(crystal_str, fmt='cif')
+
+    if primitive:
+        crystal = crystal.get_primitive_structure()
+
+    if niggli:
+        crystal = crystal.get_reduced_structure()
+
+    canonical_crystal = Structure(
+        lattice=Lattice.from_parameters(*crystal.lattice.parameters),
+        species=crystal.species,
+        coords=crystal.frac_coords,
+        coords_are_cartesian=False,
+    )
+
+
+    return canonical_crystal
+
+def refine_spacegroup(crystal, tol=0.01):
+    spga = SpacegroupAnalyzer(crystal, symprec=tol)
+    crystal = spga.get_conventional_standard_structure()
+    space_group = spga.get_space_group_number()
+    crystal = Structure(
+        lattice=Lattice.from_parameters(*crystal.lattice.parameters),
+        species=crystal.species,
+        coords=crystal.frac_coords,
+        coords_are_cartesian=False,
+    )
+    return crystal, space_group
+
+
+def get_symmetry_info(crystal, tol=0.01):
+    from pyxtal import pyxtal
+    spga = SpacegroupAnalyzer(crystal, symprec=tol)
+    crystal = spga.get_refined_structure()
+    c = pyxtal()
+    try:
+        c.from_seed(crystal, tol=0.01)
+    except:
+        c.from_seed(crystal, tol=0.0001)
+    space_group = c.group.number
+    species = []
+    anchors = []
+    matrices = []
+    coords = []
+    for site in c.atom_sites:
+        specie = site.specie
+        anchor = len(matrices)
+        coord = site.position
+        for syms in site.wp:
+            species.append(specie)
+            matrices.append(syms.affine_matrix)
+            coords.append(syms.operate(coord))
+            anchors.append(anchor)
+    anchors = np.array(anchors)
+    matrices = np.array(matrices)
+    coords = np.array(coords) % 1.
+    sym_info = {
+        'anchors':anchors,
+        'wyckoff_ops':matrices,
+        'spacegroup':space_group
+    }
+    crystal = Structure(
+        lattice=Lattice.from_parameters(*np.array(c.lattice.get_para(degree=True))),
+        species=species,
+        coords=coords,
+        coords_are_cartesian=False,
+    )
+    return crystal, sym_info
+
+def build_crystal_graph(crystal, graph_method='crystalnn'):
+
+
+    if graph_method == 'crystalnn':
+        try:
+            crystal_graph = StructureGraph.with_local_env_strategy(
+                crystal, CrystalNN)
+        except:
+            crystalNN_tmp = local_env.CrystalNN(
+
+                distance_cutoffs=(0.5,6.0),
+                x_diff_weight=-1,
+                porous_adjustment=False,
+
+                search_cutoff=20)
+
+            crystal_graph = StructureGraph.with_local_env_strategy(
+                crystal, crystalNN_tmp)
+    elif graph_method == 'none':
+        pass
+    else:
+        raise NotImplementedError
+
+    frac_coords = crystal.frac_coords
+    atom_types = crystal.atomic_numbers
+    lattice_parameters = crystal.lattice.parameters
+    lengths = lattice_parameters[:3]
+    angles = lattice_parameters[3:]
+
+    assert np.allclose(crystal.lattice.matrix,
+                       lattice_params_to_matrix(*lengths, *angles))
+
+    edge_indices, to_jimages = [], []
+    if graph_method != 'none':
+        for i, j, to_jimage in crystal_graph.graph.edges(data='to_jimage'):
+            edge_indices.append([j, i])
+            to_jimages.append(to_jimage)
+            edge_indices.append([i, j])
+            to_jimages.append(tuple(-tj for tj in to_jimage))
+
+    atom_types = np.array(atom_types)
+    lengths, angles = np.array(lengths), np.array(angles)
+    edge_indices = np.array(edge_indices)
+    to_jimages = np.array(to_jimages)
+    num_atoms = atom_types.shape[0]
+
+    return frac_coords, atom_types, lengths, angles, edge_indices, to_jimages, num_atoms
+
+
+def abs_cap(val, max_abs_val=1):
+
+
+    return max(min(val, max_abs_val), -max_abs_val)
+
+
+def lattice_params_to_matrix(a, b, c, alpha, beta, gamma):
+
+
+    angles_r = np.radians([alpha, beta, gamma])
+    cos_alpha, cos_beta, cos_gamma = np.cos(angles_r)
+    sin_alpha, sin_beta, sin_gamma = np.sin(angles_r)
+
+    val = (cos_alpha * cos_beta - cos_gamma) / (sin_alpha * sin_beta)
+
+    val = abs_cap(val)
+    gamma_star = np.arccos(val)
+
+    vector_a = [a * sin_beta, 0.0, a * cos_beta]
+    vector_b = [
+        -b * sin_alpha * np.cos(gamma_star),
+        b * sin_alpha * np.sin(gamma_star),
+        b * cos_alpha,
+    ]
+    vector_c = [0.0, 0.0, float(c)]
+    return np.array([vector_a, vector_b, vector_c])
+
+
+def lattice_params_to_matrix_torch(lengths, angles):
+
+
+    angles_r = torch.deg2rad(angles)
+    coses = torch.cos(angles_r)
+    sins = torch.sin(angles_r)
+
+    val = (coses[:, 0] * coses[:, 1] - coses[:, 2]) / (sins[:, 0] * sins[:, 1])
+
+    val = torch.clamp(val, -1., 1.)
+    gamma_star = torch.arccos(val)
+
+    vector_a = torch.stack([
+        lengths[:, 0] * sins[:, 1],
+        torch.zeros(lengths.size(0), device=lengths.device),
+        lengths[:, 0] * coses[:, 1]], dim=1)
+    vector_b = torch.stack([
+        -lengths[:, 1] * sins[:, 0] * torch.cos(gamma_star),
+        lengths[:, 1] * sins[:, 0] * torch.sin(gamma_star),
+        lengths[:, 1] * coses[:, 0]], dim=1)
+    vector_c = torch.stack([
+        torch.zeros(lengths.size(0), device=lengths.device),
+        torch.zeros(lengths.size(0), device=lengths.device),
+        lengths[:, 2]], dim=1)
+
+    return torch.stack([vector_a, vector_b, vector_c], dim=1)
+
+
+def compute_volume(batch_lattice):
+
+
+    vector_a, vector_b, vector_c = torch.unbind(batch_lattice, dim=1)
+    return torch.abs(torch.einsum('bi,bi->b', vector_a,
+                                  torch.cross(vector_b, vector_c, dim=1)))
+
+
+def lengths_angles_to_volume(lengths, angles):
+    lattice = lattice_params_to_matrix_torch(lengths, angles)
+    return compute_volume(lattice)
+
+
+def lattice_matrix_to_params(matrix):
+    lengths = np.sqrt(np.sum(matrix ** 2, axis=1)).tolist()
+
+    angles = np.zeros(3)
+    for i in range(3):
+        j = (i + 1) % 3
+        k = (i + 2) % 3
+        angles[i] = abs_cap(np.dot(matrix[j], matrix[k]) /
+                            (lengths[j] * lengths[k]))
+    angles = np.arccos(angles) * 180.0 / np.pi
+    a, b, c = lengths
+    alpha, beta, gamma = angles
+    return a, b, c, alpha, beta, gamma
+
+def lattices_to_params_shape(lattices):
+
+    lengths = torch.sqrt(torch.sum(lattices ** 2, dim=-1))
+    angles = torch.zeros_like(lengths)
+    for i in range(3):
+        j = (i + 1) % 3
+        k = (i + 2) % 3
+        angles[...,i] = torch.clamp(torch.sum(lattices[...,j,:] * lattices[...,k,:], dim = -1) /
+                            (lengths[...,j] * lengths[...,k]), -1., 1.)
+    angles = torch.arccos(angles) * 180.0 / np.pi
+
+    return lengths, angles
+
+
+def frac_to_cart_coords(
+    frac_coords,
+    lengths,
+    angles,
+    num_atoms,
+    regularized = True,
+    lattices = None
+):
+    if regularized:
+        frac_coords = frac_coords % 1.
+    if lattices is None:
+        lattices = lattice_params_to_matrix_torch(lengths, angles)
+    lattice_nodes = torch.repeat_interleave(lattices, num_atoms, dim=0)
+    pos = torch.einsum('bi,bij->bj', frac_coords, lattice_nodes)
+
+    return pos
+
+
+def cart_to_frac_coords(
+    cart_coords,
+    lengths,
+    angles,
+    num_atoms,
+    regularized = True
+):
+    lattice = lattice_params_to_matrix_torch(lengths, angles)
+
+    inv_lattice = torch.linalg.pinv(lattice)
+    inv_lattice_nodes = torch.repeat_interleave(inv_lattice, num_atoms, dim=0)
+    frac_coords = torch.einsum('bi,bij->bj', cart_coords, inv_lattice_nodes)
+    if regularized:
+        frac_coords = frac_coords % 1.
+    return frac_coords
+
+
+def get_pbc_distances(
+    coords,
+    edge_index,
+    lengths,
+    angles,
+    to_jimages,
+    num_atoms,
+    num_bonds,
+    coord_is_cart=False,
+    return_offsets=False,
+    return_distance_vec=False,
+    lattices=None
+):
+    if lattices is None:
+        lattices = lattice_params_to_matrix_torch(lengths, angles)
+
+    if coord_is_cart:
+        pos = coords
+    else:
+        lattice_nodes = torch.repeat_interleave(lattices, num_atoms, dim=0)
+        pos = torch.einsum('bi,bij->bj', coords, lattice_nodes)
+
+    j_index, i_index = edge_index
+
+    distance_vectors = pos[j_index] - pos[i_index]
+
+
+    lattice_edges = torch.repeat_interleave(lattices, num_bonds, dim=0)
+    offsets = torch.einsum('bi,bij->bj', to_jimages.float(), lattice_edges)
+    distance_vectors += offsets
+
+
+    distances = distance_vectors.norm(dim=-1)
+
+    out = {
+        "edge_index": edge_index,
+        "distances": distances,
+    }
+
+    if return_distance_vec:
+        out["distance_vec"] = distance_vectors
+
+    if return_offsets:
+        out["offsets"] = offsets
+
+    return out
+
+
+def radius_graph_pbc_wrapper(data, radius, max_num_neighbors_threshold, device):
+    cart_coords = frac_to_cart_coords(
+        data.frac_coords, data.lengths, data.angles, data.num_atoms)
+    return radius_graph_pbc(
+        cart_coords, data.lengths, data.angles, data.num_atoms, radius,
+        max_num_neighbors_threshold, device)
+
+def repeat_blocks(
+    sizes,
+    repeats,
+    continuous_indexing=True,
+    start_idx=0,
+    block_inc=0,
+    repeat_inc=0,
+):
+
+
+    assert sizes.dim() == 1
+    assert all(sizes >= 0)
+
+
+    sizes_nonzero = sizes > 0
+    if not torch.all(sizes_nonzero):
+        assert block_inc == 0
+        sizes = torch.masked_select(sizes, sizes_nonzero)
+        if isinstance(repeats, torch.Tensor):
+            repeats = torch.masked_select(repeats, sizes_nonzero)
+        if isinstance(repeat_inc, torch.Tensor):
+            repeat_inc = torch.masked_select(repeat_inc, sizes_nonzero)
+
+    if isinstance(repeats, torch.Tensor):
+        assert all(repeats >= 0)
+        insert_dummy = repeats[0] == 0
+        if insert_dummy:
+            one = sizes.new_ones(1)
+            zero = sizes.new_zeros(1)
+            sizes = torch.cat((one, sizes))
+            repeats = torch.cat((one, repeats))
+            if isinstance(block_inc, torch.Tensor):
+                block_inc = torch.cat((zero, block_inc))
+            if isinstance(repeat_inc, torch.Tensor):
+                repeat_inc = torch.cat((zero, repeat_inc))
+    else:
+        assert repeats >= 0
+        insert_dummy = False
+
+
+    r1 = torch.repeat_interleave(
+        torch.arange(len(sizes), device=sizes.device), repeats
+    )
+
+
+    N = (sizes * repeats).sum()
+
+
+    id_ar = torch.ones(N, dtype=torch.long, device=sizes.device)
+    id_ar[0] = 0
+    insert_index = sizes[r1[:-1]].cumsum(0)
+    insert_val = (1 - sizes)[r1[:-1]]
+
+    if isinstance(repeats, torch.Tensor) and torch.any(repeats == 0):
+        diffs = r1[1:] - r1[:-1]
+        indptr = torch.cat((sizes.new_zeros(1), diffs.cumsum(0)))
+        if continuous_indexing:
+
+            insert_val += segment_csr(sizes[: r1[-1]], indptr, reduce="sum")
+
+
+        if isinstance(block_inc, torch.Tensor):
+            insert_val += segment_csr(
+                block_inc[: r1[-1]], indptr, reduce="sum"
+            )
+        else:
+            insert_val += block_inc * (indptr[1:] - indptr[:-1])
+            if insert_dummy:
+                insert_val[0] -= block_inc
+    else:
+        idx = r1[1:] != r1[:-1]
+        if continuous_indexing:
+
+
+            insert_val[idx] = 1
+
+
+        insert_val[idx] += block_inc
+
+
+    if isinstance(repeat_inc, torch.Tensor):
+        insert_val += repeat_inc[r1[:-1]]
+        if isinstance(repeats, torch.Tensor):
+            repeat_inc_inner = repeat_inc[repeats > 0][:-1]
+        else:
+            repeat_inc_inner = repeat_inc[:-1]
+    else:
+        insert_val += repeat_inc
+        repeat_inc_inner = repeat_inc
+
+
+    if isinstance(repeats, torch.Tensor):
+        repeats_inner = repeats[repeats > 0][:-1]
+    else:
+        repeats_inner = repeats
+    insert_val[r1[1:] != r1[:-1]] -= repeat_inc_inner * repeats_inner
+
+
+    id_ar[insert_index] = insert_val
+
+    if insert_dummy:
+        id_ar = id_ar[1:]
+        if continuous_indexing:
+            id_ar[0] -= 1
+
+
+    id_ar[0] += start_idx
+
+
+    res = id_ar.cumsum(0)
+    return res
+
+
+def radius_graph_pbc(pos, lengths, angles, natoms, radius, max_num_neighbors_threshold, device, lattices=None):
+
+
+    batch_size = len(natoms)
+    if lattices is None:
+        cell = lattice_params_to_matrix_torch(lengths, angles)
+    else:
+        cell = lattices
+
+    atom_pos = pos
+
+
+    num_atoms_per_image = natoms
+    num_atoms_per_image_sqr = (num_atoms_per_image**2).long()
+
+
+    index_offset = (
+        torch.cumsum(num_atoms_per_image, dim=0) - num_atoms_per_image
+    )
+
+    index_offset_expand = torch.repeat_interleave(
+        index_offset, num_atoms_per_image_sqr
+    )
+    num_atoms_per_image_expand = torch.repeat_interleave(
+        num_atoms_per_image, num_atoms_per_image_sqr
+    )
+
+
+    num_atom_pairs = torch.sum(num_atoms_per_image_sqr)
+    index_sqr_offset = (
+        torch.cumsum(num_atoms_per_image_sqr, dim=0) - num_atoms_per_image_sqr
+    )
+    index_sqr_offset = torch.repeat_interleave(
+        index_sqr_offset, num_atoms_per_image_sqr
+    )
+    atom_count_sqr = (
+        torch.arange(num_atom_pairs, device=device) - index_sqr_offset
+    )
+
+
+    index1 = (
+        torch.div(
+            atom_count_sqr, num_atoms_per_image_expand, rounding_mode="floor"
+        )
+    ) + index_offset_expand
+    index2 = (
+        atom_count_sqr % num_atoms_per_image_expand
+    ) + index_offset_expand
+
+    pos1 = torch.index_select(atom_pos, 0, index1)
+    pos2 = torch.index_select(atom_pos, 0, index2)
+
+
+    cross_a2a3 = torch.cross(cell[:, 1], cell[:, 2], dim=-1)
+    cell_vol = torch.sum(cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
+    inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
+    min_dist_a1 = (1 / inv_min_dist_a1).reshape(-1,1)
+
+    cross_a3a1 = torch.cross(cell[:, 2], cell[:, 0], dim=-1)
+    inv_min_dist_a2 = torch.norm(cross_a3a1 / cell_vol, p=2, dim=-1)
+    min_dist_a2 = (1 / inv_min_dist_a2).reshape(-1,1)
+
+    cross_a1a2 = torch.cross(cell[:, 0], cell[:, 1], dim=-1)
+    inv_min_dist_a3 = torch.norm(cross_a1a2 / cell_vol, p=2, dim=-1)
+    min_dist_a3 = (1 / inv_min_dist_a3).reshape(-1,1)
+
+
+    max_rep = torch.ones(3, dtype=torch.long, device=device)
+    min_dist = torch.cat([min_dist_a1, min_dist_a2, min_dist_a3], dim=-1)
+
+
+    unit_cell_all = []
+    num_cells_all = []
+
+
+    cells_per_dim = [
+        torch.arange(-rep, rep + 1, device=device, dtype=torch.float)
+        for rep in max_rep
+    ]
+
+    unit_cell = torch.cat([_.reshape(-1,1) for _ in torch.meshgrid(cells_per_dim)], dim=-1)
+
+    num_cells = len(unit_cell)
+    unit_cell_per_atom = unit_cell.view(1, num_cells, 3).repeat(
+        len(index2), 1, 1
+    )
+    unit_cell = torch.transpose(unit_cell, 0, 1)
+    unit_cell_batch = unit_cell.view(1, 3, num_cells).expand(
+        batch_size, -1, -1
+    )
+
+
+    data_cell = torch.transpose(cell, 1, 2)
+    pbc_offsets = torch.bmm(data_cell, unit_cell_batch)
+    pbc_offsets_per_atom = torch.repeat_interleave(
+        pbc_offsets, num_atoms_per_image_sqr, dim=0
+    )
+
+
+    pos1 = pos1.view(-1, 3, 1).expand(-1, -1, num_cells)
+    pos2 = pos2.view(-1, 3, 1).expand(-1, -1, num_cells)
+    index1 = index1.view(-1, 1).repeat(1, num_cells).view(-1)
+    index2 = index2.view(-1, 1).repeat(1, num_cells).view(-1)
+
+    pos2 = pos2 + pbc_offsets_per_atom
+
+
+    atom_distance_sqr = torch.sum((pos1 - pos2) ** 2, dim=1)
+    atom_distance_sqr = atom_distance_sqr.view(-1)
+
+
+    radius_real = (min_dist.min(dim=-1)[0] + 0.01)
+
+    radius_real = torch.repeat_interleave(radius_real, num_atoms_per_image_sqr * num_cells)
+
+
+    mask_within_radius = torch.le(atom_distance_sqr, radius_real * radius_real)
+
+    mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
+    mask = torch.logical_and(mask_within_radius, mask_not_same)
+    index1 = torch.masked_select(index1, mask)
+    index2 = torch.masked_select(index2, mask)
+    unit_cell = torch.masked_select(
+        unit_cell_per_atom.view(-1, 3), mask.view(-1, 1).expand(-1, 3)
+    )
+    unit_cell = unit_cell.view(-1, 3)
+    atom_distance_sqr = torch.masked_select(atom_distance_sqr, mask)
+
+    if max_num_neighbors_threshold is not None:
+
+        mask_num_neighbors, num_neighbors_image = get_max_neighbors_mask(
+            natoms=natoms,
+            index=index1,
+            atom_distance=atom_distance_sqr,
+            max_num_neighbors_threshold=max_num_neighbors_threshold,
+        )
+
+        if not torch.all(mask_num_neighbors):
+
+            index1 = torch.masked_select(index1, mask_num_neighbors)
+            index2 = torch.masked_select(index2, mask_num_neighbors)
+            unit_cell = torch.masked_select(
+                unit_cell.view(-1, 3), mask_num_neighbors.view(-1, 1).expand(-1, 3)
+            )
+            unit_cell = unit_cell.view(-1, 3)
+
+    else:
+        ones = index1.new_ones(1).expand_as(index1)
+        num_neighbors = segment_coo(ones, index1, dim_size=natoms.sum())
+
+
+        image_indptr = torch.zeros(
+            natoms.shape[0] + 1, device=device, dtype=torch.long
+        )
+        image_indptr[1:] = torch.cumsum(natoms, dim=0)
+        num_neighbors_image = segment_csr(num_neighbors, image_indptr)
+
+    edge_index = torch.stack((index2, index1))
+
+    return edge_index, unit_cell, num_neighbors_image
+
+
+def get_max_neighbors_mask(
+    natoms, index, atom_distance, max_num_neighbors_threshold
+):
+
+
+    device = natoms.device
+    num_atoms = natoms.sum()
+
+
+    ones = index.new_ones(1).expand_as(index)
+    num_neighbors = segment_coo(ones, index, dim_size=num_atoms)
+    max_num_neighbors = num_neighbors.max()
+    num_neighbors_thresholded = num_neighbors.clamp(
+        max=max_num_neighbors_threshold
+    )
+
+
+    image_indptr = torch.zeros(
+        natoms.shape[0] + 1, device=device, dtype=torch.long
+    )
+    image_indptr[1:] = torch.cumsum(natoms, dim=0)
+    num_neighbors_image = segment_csr(num_neighbors_thresholded, image_indptr)
+
+
+    if (
+        max_num_neighbors <= max_num_neighbors_threshold
+        or max_num_neighbors_threshold <= 0
+    ):
+        mask_num_neighbors = torch.tensor(
+            [True], dtype=bool, device=device
+        ).expand_as(index)
+        return mask_num_neighbors, num_neighbors_image
+
+
+    distance_sort = torch.full(
+        [num_atoms * max_num_neighbors], np.inf, device=device
+    )
+
+
+    index_neighbor_offset = torch.cumsum(num_neighbors, dim=0) - num_neighbors
+    index_neighbor_offset_expand = torch.repeat_interleave(
+        index_neighbor_offset, num_neighbors
+    )
+    index_sort_map = (
+        index * max_num_neighbors
+        + torch.arange(len(index), device=device)
+        - index_neighbor_offset_expand
+    )
+    distance_sort.index_copy_(0, index_sort_map, atom_distance)
+    distance_sort = distance_sort.view(num_atoms, max_num_neighbors)
+
+
+    distance_sort, index_sort = torch.sort(distance_sort, dim=1)
+
+    distance_real_cutoff = distance_sort[:,max_num_neighbors_threshold].reshape(-1,1).expand(-1,max_num_neighbors) + 0.01
+
+    mask_distance = distance_sort < distance_real_cutoff
+
+    index_sort = index_sort + index_neighbor_offset.view(-1, 1).expand(
+        -1, max_num_neighbors
+    )
+
+
+    mask_finite = torch.isfinite(distance_sort)
+
+    index_sort = torch.masked_select(index_sort, mask_finite & mask_distance)
+
+    num_neighbor_per_node = (mask_finite & mask_distance).sum(dim=-1)
+    num_neighbors_image = segment_csr(num_neighbor_per_node, image_indptr)
+
+
+    mask_num_neighbors = torch.zeros(len(index), device=device, dtype=bool)
+    mask_num_neighbors.index_fill_(0, index_sort, True)
+
+    return mask_num_neighbors, num_neighbors_image
+
+
+def radius_graph_pbc_(cart_coords, lengths, angles, num_atoms,
+                     radius, max_num_neighbors_threshold, device,
+                     topk_per_pair=None):
+
+
+    batch_size = len(num_atoms)
+
+
+    atom_pos = cart_coords
+
+
+    num_atoms_per_image = num_atoms
+    num_atoms_per_image_sqr = (num_atoms_per_image ** 2).long()
+
+
+    index_offset = (
+        torch.cumsum(num_atoms_per_image, dim=0) - num_atoms_per_image
+    )
+
+    index_offset_expand = torch.repeat_interleave(
+        index_offset, num_atoms_per_image_sqr
+    )
+    num_atoms_per_image_expand = torch.repeat_interleave(
+        num_atoms_per_image, num_atoms_per_image_sqr
+    )
+
+
+    num_atom_pairs = torch.sum(num_atoms_per_image_sqr)
+    index_sqr_offset = (
+        torch.cumsum(num_atoms_per_image_sqr, dim=0) - num_atoms_per_image_sqr
+    )
+    index_sqr_offset = torch.repeat_interleave(
+        index_sqr_offset, num_atoms_per_image_sqr
+    )
+    atom_count_sqr = (
+        torch.arange(num_atom_pairs, device=device) - index_sqr_offset
+    )
+
+
+    index1 = (
+        (atom_count_sqr // num_atoms_per_image_expand)
+    ).long() + index_offset_expand
+    index2 = (
+        atom_count_sqr % num_atoms_per_image_expand
+    ).long() + index_offset_expand
+
+    pos1 = torch.index_select(atom_pos, 0, index1)
+    pos2 = torch.index_select(atom_pos, 0, index2)
+
+    unit_cell = torch.tensor(OFFSET_LIST, device=device).float()
+    num_cells = len(unit_cell)
+    unit_cell_per_atom = unit_cell.view(1, num_cells, 3).repeat(
+        len(index2), 1, 1
+    )
+    unit_cell = torch.transpose(unit_cell, 0, 1)
+    unit_cell_batch = unit_cell.view(1, 3, num_cells).expand(
+        batch_size, -1, -1
+    )
+
+
+    lattice = lattice_params_to_matrix_torch(lengths, angles)
+
+
+    data_cell = torch.transpose(lattice, 1, 2)
+    pbc_offsets = torch.bmm(data_cell, unit_cell_batch)
+    pbc_offsets_per_atom = torch.repeat_interleave(
+        pbc_offsets, num_atoms_per_image_sqr, dim=0
+    )
+
+
+    pos1 = pos1.view(-1, 3, 1).expand(-1, -1, num_cells)
+    pos2 = pos2.view(-1, 3, 1).expand(-1, -1, num_cells)
+    index1 = index1.view(-1, 1).repeat(1, num_cells).view(-1)
+    index2 = index2.view(-1, 1).repeat(1, num_cells).view(-1)
+
+    pos2 = pos2 + pbc_offsets_per_atom
+
+
+    atom_distance_sqr = torch.sum((pos1 - pos2) ** 2, dim=1)
+
+    if topk_per_pair is not None:
+        assert topk_per_pair.size(0) == num_atom_pairs
+        atom_distance_sqr_sort_index = torch.argsort(atom_distance_sqr, dim=1)
+        assert atom_distance_sqr_sort_index.size() == (num_atom_pairs, num_cells)
+        atom_distance_sqr_sort_index = (
+            atom_distance_sqr_sort_index +
+            torch.arange(num_atom_pairs, device=device)[:, None] * num_cells).view(-1)
+        topk_mask = (torch.arange(num_cells, device=device)[None, :] <
+                     topk_per_pair[:, None])
+        topk_mask = topk_mask.view(-1)
+        topk_indices = atom_distance_sqr_sort_index.masked_select(topk_mask)
+
+        topk_mask = torch.zeros(num_atom_pairs * num_cells, device=device)
+        topk_mask.scatter_(0, topk_indices, 1.)
+        topk_mask = topk_mask.bool()
+
+    atom_distance_sqr = atom_distance_sqr.view(-1)
+
+
+    mask_within_radius = torch.le(atom_distance_sqr, radius * radius)
+
+    mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
+    mask = torch.logical_and(mask_within_radius, mask_not_same)
+    index1 = torch.masked_select(index1, mask)
+    index2 = torch.masked_select(index2, mask)
+    unit_cell = torch.masked_select(
+        unit_cell_per_atom.view(-1, 3), mask.view(-1, 1).expand(-1, 3)
+    )
+    unit_cell = unit_cell.view(-1, 3)
+    if topk_per_pair is not None:
+        topk_mask = torch.masked_select(topk_mask, mask)
+
+    num_neighbors = torch.zeros(len(cart_coords), device=device)
+    num_neighbors.index_add_(0, index1, torch.ones(len(index1), device=device))
+    num_neighbors = num_neighbors.long()
+    max_num_neighbors = torch.max(num_neighbors).long()
+
+
+    _max_neighbors = copy.deepcopy(num_neighbors)
+    _max_neighbors[
+        _max_neighbors > max_num_neighbors_threshold
+    ] = max_num_neighbors_threshold
+    _num_neighbors = torch.zeros(len(cart_coords) + 1, device=device).long()
+    _natoms = torch.zeros(num_atoms.shape[0] + 1, device=device).long()
+    _num_neighbors[1:] = torch.cumsum(_max_neighbors, dim=0)
+    _natoms[1:] = torch.cumsum(num_atoms, dim=0)
+    num_neighbors_image = (
+        _num_neighbors[_natoms[1:]] - _num_neighbors[_natoms[:-1]]
+    )
+
+
+    if (
+        max_num_neighbors <= max_num_neighbors_threshold
+        or max_num_neighbors_threshold <= 0
+    ):
+        if topk_per_pair is None:
+            return torch.stack((index2, index1)), unit_cell, num_neighbors_image
+        else:
+            return torch.stack((index2, index1)), unit_cell, num_neighbors_image, topk_mask
+
+    atom_distance_sqr = torch.masked_select(atom_distance_sqr, mask)
+
+
+    distance_sort = torch.zeros(
+        len(cart_coords) * max_num_neighbors, device=device
+    ).fill_(radius * radius + 1.0)
+
+
+    index_neighbor_offset = torch.cumsum(num_neighbors, dim=0) - num_neighbors
+    index_neighbor_offset_expand = torch.repeat_interleave(
+        index_neighbor_offset, num_neighbors
+    )
+    index_sort_map = (
+        index1 * max_num_neighbors
+        + torch.arange(len(index1), device=device)
+        - index_neighbor_offset_expand
+    )
+    distance_sort.index_copy_(0, index_sort_map, atom_distance_sqr)
+    distance_sort = distance_sort.view(len(cart_coords), max_num_neighbors)
+
+
+    distance_sort, index_sort = torch.sort(distance_sort, dim=1)
+
+    distance_sort = distance_sort[:, :max_num_neighbors_threshold]
+    index_sort = index_sort[:, :max_num_neighbors_threshold]
+
+
+    index_sort = index_sort + index_neighbor_offset.view(-1, 1).expand(
+        -1, max_num_neighbors_threshold
+    )
+
+    mask_within_radius = torch.le(distance_sort, radius * radius)
+    index_sort = torch.masked_select(index_sort, mask_within_radius)
+
+
+    mask_num_neighbors = torch.zeros(len(index1), device=device).bool()
+    mask_num_neighbors.index_fill_(0, index_sort, True)
+
+
+    index1 = torch.masked_select(index1, mask_num_neighbors)
+    index2 = torch.masked_select(index2, mask_num_neighbors)
+    unit_cell = torch.masked_select(
+        unit_cell.view(-1, 3), mask_num_neighbors.view(-1, 1).expand(-1, 3)
+    )
+    unit_cell = unit_cell.view(-1, 3)
+
+    if topk_per_pair is not None:
+        topk_mask = torch.masked_select(topk_mask, mask_num_neighbors)
+
+    edge_index = torch.stack((index2, index1))
+
+    if topk_per_pair is None:
+        return edge_index, unit_cell, num_neighbors_image
+    else:
+        return edge_index, unit_cell, num_neighbors_image, topk_mask
+
+
+def min_distance_sqr_pbc(cart_coords1, cart_coords2, lengths, angles,
+                         num_atoms, device, return_vector=False,
+                         return_to_jimages=False):
+
+
+    batch_size = len(num_atoms)
+
+
+    pos1 = cart_coords1
+    pos2 = cart_coords2
+
+    unit_cell = torch.tensor(OFFSET_LIST, device=device).float()
+    num_cells = len(unit_cell)
+    unit_cell_per_atom = unit_cell.view(1, num_cells, 3).repeat(
+        len(cart_coords2), 1, 1
+    )
+    unit_cell = torch.transpose(unit_cell, 0, 1)
+    unit_cell_batch = unit_cell.view(1, 3, num_cells).expand(
+        batch_size, -1, -1
+    )
+
+
+    lattice = lattice_params_to_matrix_torch(lengths, angles)
+
+
+    data_cell = torch.transpose(lattice, 1, 2)
+    pbc_offsets = torch.bmm(data_cell, unit_cell_batch)
+    pbc_offsets_per_atom = torch.repeat_interleave(
+        pbc_offsets, num_atoms, dim=0
+    )
+
+
+    pos1 = pos1.view(-1, 3, 1).expand(-1, -1, num_cells)
+    pos2 = pos2.view(-1, 3, 1).expand(-1, -1, num_cells)
+
+    pos2 = pos2 + pbc_offsets_per_atom
+
+
+    atom_distance_vector = pos1 - pos2
+    atom_distance_sqr = torch.sum(atom_distance_vector ** 2, dim=1)
+
+    min_atom_distance_sqr, min_indices = atom_distance_sqr.min(dim=-1)
+
+    return_list = [min_atom_distance_sqr]
+
+    if return_vector:
+        min_indices = min_indices[:, None, None].repeat([1, 3, 1])
+
+        min_atom_distance_vector = torch.gather(
+            atom_distance_vector, 2, min_indices).squeeze(-1)
+
+        return_list.append(min_atom_distance_vector)
+
+    if return_to_jimages:
+        to_jimages = unit_cell.T[min_indices].long()
+        return_list.append(to_jimages)
+
+    return return_list[0] if len(return_list) == 1 else return_list
+
+
+class StandardScalerTorch(object):
+
+
+    def __init__(self, means=None, stds=None):
+        self.means = means
+        self.stds = stds
+
+    def fit(self, X):
+        X = torch.tensor(X, dtype=torch.float)
+        self.means = torch.mean(X, dim=0)
+
+        self.stds = torch.std(X, dim=0, unbiased=False) + EPSILON
+
+    def transform(self, X):
+        X = torch.tensor(X, dtype=torch.float)
+        return (X - self.means) / self.stds
+
+    def inverse_transform(self, X):
+        X = torch.tensor(X, dtype=torch.float)
+        return X * self.stds + self.means
+
+    def match_device(self, tensor):
+        if self.means.device != tensor.device:
+            self.means = self.means.to(tensor.device)
+            self.stds = self.stds.to(tensor.device)
+
+    def copy(self):
+        return StandardScalerTorch(
+            means=self.means.clone().detach(),
+            stds=self.stds.clone().detach())
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"means: {self.means.tolist()}, "
+            f"stds: {self.stds.tolist()})"
+        )
+
+
+def get_scaler_from_data_list(data_list, key):
+    targets = torch.tensor([d[key] for d in data_list])
+    scaler = StandardScalerTorch()
+    scaler.fit(targets)
+    return scaler
+
+
+import signal
+import traceback
+
+
+class TimeoutException(Exception):
+
+    pass
+
+
+def _timeout_handler(signum, frame):
+
+    raise TimeoutException("Processing timed out")
+
+
+def build_crystal_graph(crystal, graph_method='crystalnn', max_atoms_for_crystalnn=200):
+
+
+    frac_coords = crystal.frac_coords
+    atom_types = crystal.atomic_numbers
+    lattice_parameters = crystal.lattice.parameters
+    lengths = lattice_parameters[:3]
+    angles = lattice_parameters[3:]
+    num_atoms_count = len(crystal)
+
+
+    assert np.allclose(crystal.lattice.matrix,
+                       lattice_params_to_matrix(*lengths, *angles))
+
+    edge_indices, to_jimages = [], []
+
+    if graph_method == 'crystalnn':
+        crystal_graph = None
+
+
+        if num_atoms_count > max_atoms_for_crystalnn:
+            crystal_graph = _build_graph_fast_method(crystal, num_atoms_count)
+        else:
+
+            crystal_graph = _try_crystalnn_methods(crystal, num_atoms_count)
+
+
+        if crystal_graph is not None:
+            try:
+                for i, j, to_jimage in crystal_graph.graph.edges(data='to_jimage'):
+                    edge_indices.append([j, i])
+                    to_jimages.append(to_jimage)
+                    edge_indices.append([i, j])
+                    to_jimages.append(tuple(-tj for tj in to_jimage))
+            except Exception as e:
+                print(f"  [Warning] Failed to extract edges: {e}")
+                edge_indices, to_jimages = [], []
+
+    elif graph_method == 'none':
+        pass
+    else:
+        raise NotImplementedError(f"Unknown graph_method: {graph_method}")
+
+
+    atom_types = np.array(atom_types)
+    lengths, angles = np.array(lengths), np.array(angles)
+
+    if len(edge_indices) > 0:
+        edge_indices = np.array(edge_indices)
+        to_jimages = np.array(to_jimages)
+    else:
+
+        edge_indices = np.array([], dtype=np.int64).reshape(0, 2)
+        to_jimages = np.array([], dtype=np.int64).reshape(0, 3)
+
+    num_atoms = atom_types.shape[0]
+
+    return frac_coords, atom_types, lengths, angles, edge_indices, to_jimages, num_atoms
+
+
+def _try_crystalnn_methods(crystal, num_atoms):
+
+
+    try:
+        crystalnn_conservative = local_env.CrystalNN(
+            distance_cutoffs=(0.5, 4.0),
+            x_diff_weight=-1,
+            porous_adjustment=False,
+            search_cutoff=7
+        )
+        crystal_graph = StructureGraph.with_local_env_strategy(
+            crystal, crystalnn_conservative)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    try:
+        crystal_graph = StructureGraph.with_local_env_strategy(crystal, CrystalNN)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    try:
+        crystalnn_relaxed = local_env.CrystalNN(
+            distance_cutoffs=(0.5, 6.0),
+            x_diff_weight=-1,
+            porous_adjustment=False,
+            search_cutoff=10
+        )
+        crystal_graph = StructureGraph.with_local_env_strategy(
+            crystal, crystalnn_relaxed)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    return _build_graph_fast_method(crystal, num_atoms)
+
+
+def _build_graph_fast_method(crystal, num_atoms):
+
+
+    try:
+        from pymatgen.analysis.local_env import MinimumDistanceNN
+        nn = MinimumDistanceNN(cutoff=5.0, get_all_sites=True)
+        crystal_graph = StructureGraph.with_local_env_strategy(crystal, nn)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    try:
+        from pymatgen.analysis.local_env import VoronoiNN
+        nn = VoronoiNN(
+            tol=0.5,
+            cutoff=10.0,
+            allow_pathological=True,
+            weight='solid_angle',
+            extra_nn_info=False
+        )
+        crystal_graph = StructureGraph.with_local_env_strategy(crystal, nn)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    try:
+        from pymatgen.analysis.local_env import CutOffDictNN
+        nn = CutOffDictNN(cut_off_dict={})
+        crystal_graph = StructureGraph.with_local_env_strategy(crystal, nn)
+        return crystal_graph
+    except Exception:
+        pass
+
+
+    print(f"  [Warning] All graph methods failed for structure with {num_atoms} atoms")
+    return None
+
+
+import signal
+import gc
+import time
+from pathlib import Path
+from multiprocessing import Pool
+from tqdm import tqdm
+
+
+class TimeoutException(Exception):
+
+    pass
+
+
+def _timeout_handler(signum, frame):
+
+    raise TimeoutException("Processing timed out")
+
+
+def process_one_core(row_dict, niggli, primitive, graph_method, prop_list,
+                     use_space_group, tol, timeout):
+
+
+    mat_id = row_dict.get('material_id', 'unknown')
+
+
+    old_handler = None
+    use_timeout = hasattr(signal, 'SIGALRM') and timeout > 0
+
+    if use_timeout:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)
+
+    try:
+        crystal_str = row_dict['cif']
+        crystal = build_crystal(crystal_str, niggli=niggli, primitive=primitive)
+
+        result_dict = {}
+
+        if use_space_group:
+            crystal, sym_info = get_symmetry_info(crystal, tol=tol)
+            result_dict.update(sym_info)
+        else:
+            result_dict['spacegroup'] = 1
+
+
+        graph_arrays = build_crystal_graph(crystal, graph_method)
+
+
+        if use_timeout:
+            signal.alarm(0)
+
+        properties = {k: row_dict[k] for k in prop_list if k in row_dict.keys()}
+        result_dict.update({
+            'mp_id': mat_id,
+            'cif': crystal_str,
+            'graph_arrays': graph_arrays
+        })
+        result_dict.update(properties)
+
+        return result_dict
+
+    except TimeoutException:
+        print(f"[Timeout] {mat_id}: exceeded {timeout}s, skipping")
+        return None
+
+    except Exception as e:
+        print(f"[Error] {mat_id}: {type(e).__name__}: {e}")
+        return None
+
+    finally:
+
+        if use_timeout:
+            try:
+                signal.alarm(0)
+                if old_handler is not None:
+                    signal.signal(signal.SIGALRM, old_handler)
+            except:
+                pass
+
+
+def _process_one_wrapper(args):
+
+    return process_one_core(*args)
+
+
+def _process_one_with_index(indexed_arg):
+
+
+    idx, args = indexed_arg
+    result = process_one_core(*args)
+    return (idx, result)
+
+
+def preprocess(input_file, num_workers, niggli, primitive, graph_method,
+               prop_list, use_space_group=False, tol=0.01, timeout=120):
+
+
+    gc.collect()
+
+    df = pd.read_csv(input_file)
+    total_records = len(df)
+
+
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        available_gb = mem.available / (1024**3)
+        total_gb = mem.total / (1024**3)
+        used_gb = mem.used / (1024**3)
+    except ImportError:
+        available_gb = 20
+        total_gb = 60
+        used_gb = 40
+
+    print(f"\n{'='*70}")
+    print(f"内存状态: 已用 {used_gb:.1f}GB / 总计 {total_gb:.1f}GB / 可用 {available_gb:.1f}GB")
+    print(f"数据文件: {input_file}")
+    print(f"记录总数: {total_records:,}")
+    print(f"超时设置: {timeout}秒/结构 (子进程内部控制)")
+    print(f"进程数: {num_workers}")
+    print(f"{'='*70}")
+
+
+    mpid_to_global = {df.iloc[i]['material_id']: i for i in range(total_records)}
+
+
+    BATCH_SIZE = 30000
+
+
+    input_path = Path(input_file)
+    cache_dir = input_path.parent / f".{input_path.stem}_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    num_batches = (total_records + BATCH_SIZE - 1) // BATCH_SIZE
+    print(f"分批处理: {num_batches} 个批次，每批 {BATCH_SIZE} 条")
+    print(f"缓存目录: {cache_dir}")
+
+
+    completed_batches = set()
+    for f in cache_dir.glob("batch_*.pt"):
+        try:
+            batch_num = int(f.stem.split("_")[1])
+            completed_batches.add(batch_num)
+        except:
+            pass
+
+    if completed_batches:
+        print(f"已缓存批次: {sorted(completed_batches)}")
+        print(f"共 {len(completed_batches)}/{num_batches} 个批次已完成")
+
+
+    results = [None] * total_records
+    total_success = 0
+    total_timeout = 0
+    total_error = 0
+
+    start_time = time.time()
+
+    for batch_idx in range(num_batches):
+        batch_cache_file = cache_dir / f"batch_{batch_idx:04d}.pt"
+
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, total_records)
+        batch_size = end_idx - start_idx
+
+
+        if batch_idx in completed_batches:
+            print(f"[{batch_idx+1}/{num_batches}] 从缓存加载 {batch_cache_file.name}...")
+            try:
+                cached_data = torch.load(batch_cache_file)
+                loaded_count = 0
+
+                for item in cached_data:
+                    idx, result = item
+                    if result is None:
+                        continue
+
+
+                    mp_id = result.get('mp_id', None)
+                    if mp_id and mp_id in mpid_to_global:
+                        global_idx = mpid_to_global[mp_id]
+                    elif idx >= batch_size:
+                        global_idx = idx
+                    else:
+                        global_idx = start_idx + idx
+
+                    if 0 <= global_idx < total_records:
+                        results[global_idx] = result
+                        loaded_count += 1
+
+                total_success += loaded_count
+                print(f"  加载了 {loaded_count} 条记录")
+                continue
+
+            except Exception as e:
+                print(f"  缓存加载失败: {e}，重新处理...")
+                completed_batches.discard(batch_idx)
+
+
+        gc.collect()
+
+
+        indexed_args = []
+        for i in range(start_idx, end_idx):
+            row_dict = df.iloc[i].to_dict()
+            args = (row_dict, niggli, primitive, graph_method, prop_list,
+                    use_space_group, tol, timeout)
+            local_idx = i - start_idx
+            indexed_args.append((local_idx, args))
+
+        print(f"\n[{batch_idx+1}/{num_batches}] 处理 {start_idx:,}-{end_idx:,}...")
+        batch_start_time = time.time()
+
+
+        batch_results = [None] * len(indexed_args)
+        batch_success = 0
+        batch_failed = 0
+
+
+        pool = Pool(processes=num_workers, maxtasksperchild=50)
+
+        try:
+
+            chunksize = max(1, len(indexed_args) // (num_workers * 4))
+
+
+            results_iter = pool.imap_unordered(
+                _process_one_with_index,
+                indexed_args,
+                chunksize=chunksize
+            )
+
+
+            pbar = tqdm(total=len(indexed_args), desc=f"Batch {batch_idx+1}/{num_batches}", ncols=100)
+
+            for idx, result in results_iter:
+                batch_results[idx] = result
+                if result is not None:
+                    batch_success += 1
+                else:
+                    batch_failed += 1
+                pbar.update(1)
+
+            pbar.close()
+
+        finally:
+            pool.close()
+            pool.join()
+
+
+        for local_idx, result in enumerate(batch_results):
+            if result is not None:
+                global_idx = start_idx + local_idx
+                results[global_idx] = result
+
+        total_success += batch_success
+        total_error += batch_failed
+
+
+        indexed_results = []
+        for local_idx, result in enumerate(batch_results):
+            if result is not None:
+                global_idx = start_idx + local_idx
+                indexed_results.append((global_idx, result))
+        indexed_results.sort(key=lambda x: x[0])
+        torch.save(indexed_results, batch_cache_file)
+
+        batch_time = time.time() - batch_start_time
+        print(f"  完成: 成功={batch_success}, 失败={batch_failed}, 耗时={batch_time:.0f}s")
+
+
+        elapsed = time.time() - start_time
+        processed_batches = batch_idx + 1 - len([b for b in completed_batches if b <= batch_idx])
+        remaining = num_batches - batch_idx - 1
+        if processed_batches > 0 and remaining > 0:
+            eta = (elapsed / processed_batches) * remaining
+            print(f"  进度: 总成功 {total_success:,} | ETA {eta/60:.1f}分钟")
+
+        del batch_results, indexed_results, indexed_args
+        gc.collect()
+
+    del mpid_to_global
+
+
+    final_results = [r for r in results if r is not None]
+
+    total_time = time.time() - start_time
+    print(f"\n{'='*70}")
+    print(f"处理完成!")
+    print(f"成功: {total_success:,}")
+    print(f"失败/超时: {total_error:,}")
+    print(f"最终结果: {len(final_results):,} 条")
+    print(f"总耗时: {total_time/60:.1f}分钟")
+    print(f"{'='*70}")
+
+    gc.collect()
+
+    return final_results
+
+
+def _process_batch_with_timeout(args_list, mat_ids, num_workers, timeout, desc="Processing"):
+
+
+    batch_size = len(args_list)
+    results = [None] * batch_size
+    success_count = 0
+    timeout_count = 0
+    error_count = 0
+    timeout_ids = []
+
+
+    pool = Pool(processes=num_workers, maxtasksperchild=100)
+
+    try:
+
+        async_results = {}
+        for i, args in enumerate(args_list):
+            async_result = pool.apply_async(_process_one_wrapper, (args,))
+            async_results[i] = {
+                'mat_id': mat_ids[i],
+                'async_result': async_result,
+                'start_time': time.time(),
+                'done': False
+            }
+
+
+        pbar = tqdm(total=batch_size, desc=desc, ncols=100)
+
+
+        check_interval = 0.5
+
+        while True:
+            completed_in_round = 0
+            still_pending = 0
+
+            for i, task_info in async_results.items():
+                if task_info['done']:
+                    continue
+
+                mat_id = task_info['mat_id']
+                async_result = task_info['async_result']
+                start_time = task_info['start_time']
+                elapsed = time.time() - start_time
+
+
+                if async_result.ready():
+                    try:
+                        result = async_result.get(timeout=0)
+                        if result is not None:
+                            results[i] = result
+                            success_count += 1
+                        else:
+                            error_count += 1
+                    except Exception as e:
+                        error_count += 1
+
+
+                    task_info['done'] = True
+                    completed_in_round += 1
+                    pbar.update(1)
+
+
+                elif elapsed > timeout:
+                    timeout_count += 1
+                    timeout_ids.append(mat_id)
+
+
+                    if len(timeout_ids) <= 5:
+                        pbar.write(f"[Timeout] {mat_id}: {elapsed:.0f}s > {timeout}s, skipping")
+                    elif len(timeout_ids) == 6:
+                        pbar.write(f"[Timeout] ... 更多超时信息已省略")
+
+                    task_info['done'] = True
+                    completed_in_round += 1
+                    pbar.update(1)
+
+                else:
+                    still_pending += 1
+
+
+            if still_pending == 0:
+                break
+
+
+            time.sleep(check_interval)
+
+        pbar.close()
+
+    finally:
+
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            pass
+
+    return results, success_count, timeout_count, error_count, timeout_ids
+
+
+def preprocess_tensors(crystal_array_list, niggli, primitive, graph_method):
+    def process_one(batch_idx, crystal_array, niggli, primitive, graph_method):
+        frac_coords = crystal_array['frac_coords']
+        atom_types = crystal_array['atom_types']
+        lengths = crystal_array['lengths']
+        angles = crystal_array['angles']
+        crystal = Structure(
+            lattice=Lattice.from_parameters(
+                *(lengths.tolist() + angles.tolist())),
+            species=atom_types,
+            coords=frac_coords,
+            coords_are_cartesian=False)
+        graph_arrays = build_crystal_graph(crystal, graph_method)
+        result_dict = {
+            'batch_idx': batch_idx,
+            'graph_arrays': graph_arrays,
+        }
+        return result_dict
+
+    unordered_results = p_umap(
+        process_one,
+        list(range(len(crystal_array_list))),
+        crystal_array_list,
+        [niggli] * len(crystal_array_list),
+        [primitive] * len(crystal_array_list),
+        [graph_method] * len(crystal_array_list),
+        num_cpus=30,
+    )
+    ordered_results = list(
+        sorted(unordered_results, key=lambda x: x['batch_idx']))
+    return ordered_results
+
+
+def add_scaled_lattice_prop(data_list, lattice_scale_method):
+    for dict in data_list:
+        graph_arrays = dict['graph_arrays']
+
+        lengths = graph_arrays[2]
+        angles = graph_arrays[3]
+        num_atoms = graph_arrays[-1]
+        assert lengths.shape[0] == angles.shape[0] == 3
+        assert isinstance(num_atoms, int)
+
+        if lattice_scale_method == 'scale_length':
+            lengths = lengths / float(num_atoms)**(1/3)
+
+        dict['scaled_lattice'] = np.concatenate([lengths, angles])
+
+
+def mard(targets, preds):
+
+    assert torch.all(targets > 0.)
+    return torch.mean(torch.abs(targets - preds) / targets)
+
+
+def batch_accuracy_precision_recall(
+    pred_edge_probs,
+    edge_overlap_mask,
+    num_bonds
+):
+    if (pred_edge_probs is None and edge_overlap_mask is None and
+            num_bonds is None):
+        return 0., 0., 0.
+    pred_edges = pred_edge_probs.max(dim=1)[1].float()
+    target_edges = edge_overlap_mask.float()
+
+    start_idx = 0
+    accuracies, precisions, recalls = [], [], []
+    for num_bond in num_bonds.tolist():
+        pred_edge = pred_edges.narrow(
+            0, start_idx, num_bond).detach().cpu().numpy()
+        target_edge = target_edges.narrow(
+            0, start_idx, num_bond).detach().cpu().numpy()
+
+        accuracies.append(accuracy_score(target_edge, pred_edge))
+        precisions.append(precision_score(
+            target_edge, pred_edge, average='binary'))
+        recalls.append(recall_score(target_edge, pred_edge, average='binary'))
+
+        start_idx = start_idx + num_bond
+
+    return np.mean(accuracies), np.mean(precisions), np.mean(recalls)
+
+
+class StandardScaler:
+
+
+    def __init__(self, means=None, stds=None, replace_nan_token=None):
+
+
+        self.means = means
+        self.stds = stds
+        self.replace_nan_token = replace_nan_token
+
+    def fit(self, X):
+
+
+        X = np.array(X).astype(float)
+        self.means = np.nanmean(X, axis=0)
+        self.stds = np.nanstd(X, axis=0)
+        self.means = np.where(np.isnan(self.means),
+                              np.zeros(self.means.shape), self.means)
+        self.stds = np.where(np.isnan(self.stds),
+                             np.ones(self.stds.shape), self.stds)
+        self.stds = np.where(self.stds == 0, np.ones(
+            self.stds.shape), self.stds)
+
+        return self
+
+    def transform(self, X):
+
+
+        X = np.array(X).astype(float)
+        transformed_with_nan = (X - self.means) / self.stds
+        transformed_with_none = np.where(
+            np.isnan(transformed_with_nan), self.replace_nan_token, transformed_with_nan)
+
+        return transformed_with_none
+
+    def inverse_transform(self, X):
+
+
+        X = np.array(X).astype(float)
+        transformed_with_nan = X * self.stds + self.means
+        transformed_with_none = np.where(
+            np.isnan(transformed_with_nan), self.replace_nan_token, transformed_with_nan)
+
+        return transformed_with_none

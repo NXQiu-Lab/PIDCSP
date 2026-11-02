@@ -1,0 +1,14 @@
+_target_: pidcsp.pl_modules.pidcsp_c_diffusion.PIDCSPDiffusion
+time_dim: 256
+latent_dim: 0
+cost_coord: 1.
+cost_lattice: 1.
+max_neighbors: 20
+radius: 7.
+timesteps: 1000
+
+
+defaults:
+  - decoder: pidcsp_g_fusion
+  - beta_scheduler: cosine
+  - sigma_scheduler: wrapped

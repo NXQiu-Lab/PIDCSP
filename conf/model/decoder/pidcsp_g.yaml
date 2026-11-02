@@ -1,0 +1,39 @@
+_target_: pidcsp.pl_modules.pidcsp_g.PIDCSPNet
+hidden_dim: 512
+latent_dim: 0
+max_atoms: 100
+num_layers: 6
+act_fn: silu
+dis_emb: sin
+num_freqs: 128
+edge_style: fc
+max_neighbors: ${model.max_neighbors}
+cutoff: ${model.radius}
+ln: true
+ip: true
+smooth: false
+pred_type: false
+pred_scalar: false
+
+use_phys_emb: true
+phys_props: true
+phys_props_grad: false
+phys_pg: true
+phys_data_path: ${oc.env:PROJECT_ROOT,.}/embeddings/phys_embedding_data.pt
+
+
+use_attention: true
+num_heads: 8
+
+alpha: 0.2
+use_time_phys_mod: true
+
+
+use_phys_type_guidance: true
+use_phys_lattice_bias: true
+
+
+dropout: 0.0
+phys_edge_weight: 0.6
+
+time_mod_min: 0.6
