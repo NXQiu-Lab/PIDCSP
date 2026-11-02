@@ -1,2 +1,2 @@
-# PIGANet
-PIGANet: Physics-Informed Graph Attention Networks for Crystal Structure Prediction
+# PIDCSP
+PIDCSP: Task-Adaptive Physics-Informed Diffusion for Crystal Structure Generation
